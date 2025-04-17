@@ -91,7 +91,7 @@ class ApplyServiceTest {
         // 좌측 : 기대값 , 우측 : 실제 발행된 쿠폰 수량
         assertEquals(100, resultCnt);
 
-    }
+    }   // End Test 2-1
 
 
     /**
@@ -118,9 +118,24 @@ class ApplyServiceTest {
      *              {coupon_count : 2}
      *              ...
      *     * 참고로 flushAll 은 데이터 초기화 명령어
-     * 우리는 incr 명령어를 활용하여 발급된 쿠폰의 갯수를 제어할 것임.
+     * 우리는 방안 3) 을 활용하여 incr 명령어를 활용하여 발급된 쿠폰의 갯수를 제어할 것임.
      * 쿠폰을 발급하기 전에 coupon_count 를 1 증가시키고 리턴되는 값이 100 보다 크다면
      * 이미 100개 이상이 발급되었다는 뜻이므로 더 이상 쿠폰이 발급되면 안됨.
+     *
+     * [방안 3) 사용 시 발생 가능한 문제점]
+     * 문제점 1) 현재 로직은 Redis 를 활용해서 쿠폰의 발급 갯수를 가져온 후에 발급이 가능하다면 RDB 에 저장하는 방식
+     *         이 방식은 발급하는 쿠폰의 갯수가 많아지면 RDB 에 부하를 주게 되며 사용하는 RDB 가 다양한 곳에서 사용하는 DB 라면
+     *         다른 서비스에도 장애를 초래할 수 있음.
+     *          ex) MySql 이 1분 당 100개의 insert 작업만 가능하다고 가정.
+     *              - 10 : 00 분에 10,000 개의 쿠폰 생성 요청
+     *                10 : 01 분에 주문 생성 요청
+     *                10 : 02 분에 회원 가입 요청
+     *          이렇게 되면 1분에 100개씩 10,000 개를 생성하려면 100분 이라는 시간이 소요됨.
+     *          10 : 01, 10 : 02 에 들어온 요청은 100분 이후에 생성이 됨.
+     *          타임 아웃이 없다면 느리게라도 모든 요청이 처리 되겠지만 대부분의 서비스에는 타임아웃 옵션이 설정되어 있고
+     *          그러므로 주문 회원가입 뿐만 아니라 일부분의 쿠폰도 생성되지 않는 오류가 발생할 수 있음.
+     * 문제점 2) 짧은 시간 내에 많은 요청이 들어오게 된다면 DB 서버의 리소스를 많이 사용하게 되므로 부하가 발생하고
+     *         서비스 지연 / 오류로 이어질 수 있음.
      */
     @Test
     public void applyMultipleBasedOnRedis() throws InterruptedException {
@@ -156,5 +171,65 @@ class ApplyServiceTest {
         // 좌측 : 기대값 , 우측 : 실제 발행된 쿠폰 수량
         assertEquals(100, resultCnt);
 
-    }
+    }   // End Test 2-2
+
+
+    /**
+     * Test 2-3) Redis + kafka 를 활용하여 동시에 요청이 여러개가 들어오는 경우 쿠폰 정상 발급 여부 체크
+     *      테스트 전에 kafka 에 대해 간략하게 알아보자면
+     *      kafka 는 '분산 이벤트 스트리밍 플랫폼' 으로 이벤트 스트리밍이란 소스에서 목적지까지 이벤트를 실시간으로 스트리밍 하는 것임.
+     *      kafka 의 기본 구성은
+     *      Producer --> Topic <-- Consumer
+     *      로 구성되어 있음.
+     *      Topic : Queue 라고 생각하면 됨
+     *      Producer : Topic 에 데이터를 삽입할 수 있는 기능을 가짐
+     *      Consumer : Topic 에 삽입된 데이터를 가져갈 수 있는 기능을 가짐
+     *      그래서 kafka 는
+     *      소스에서 (Producer) 에서 목적지까지 (Consumer) 데이터를 실시간으로 스트리밍 할 수 있는 플랫폼이라고 함.
+     *  그래서 이번 기능 개발의 목표는!
+     *      Producer 를 활용하여 쿠폰을 생성할 유저의 아이디를 Topic 에 넣고
+     *      Consumer 를 활용하여 유저의 아이디를 가져와서 쿠폰을 생성 / 변경 하도록 하자.
+     *
+     *  kafka 를 사용하게 되면 Api 를 통해 직접 쿠폰을 발급할 때에 비해서 처리량을 조절할 수 있고
+     *  처리량을 조절함에 따라 데이터베이스의 부하를 줄일 수 있다는 장점이 있음.
+     *  다만, 테스트케이스에서 확인 했다시피 쿠폰 생성까지 약간의 텀이 발생된다는 단점이 존재한다.
+     */
+    @Test
+    public void applyMultipleBasedOnKafka() throws InterruptedException {
+        // 천 개의 요청을 보낸다고 가정
+        int threadCnt = 1000;
+
+        // ExecutorService : 병렬작업을 간단하게 할 수 있도록 하는 자바 API
+        ExecutorService executorService = Executors.newFixedThreadPool(32);
+
+        /**
+         *  모든 요청이 끝날때까지 기다려야하므로 CountDownLatch 사용
+         *  CountDownLatch : 다른 스레드에서 수행하는 작업을 기다리도록 도와주는 클래스
+         */
+        CountDownLatch countDownLatch = new CountDownLatch(threadCnt);
+
+        // 반복문을 사용하여 threadCnt 만큼의 요청보냄
+        for(int i = 0; i < threadCnt; i++) {
+            long userId = i;
+            executorService.submit(() -> {
+                try {
+                    applyService.applyBasedOnRedisWithKafka(userId);
+                } finally {
+                    countDownLatch.countDown();
+                }
+            });
+        }
+
+        countDownLatch.await();
+
+        Thread.sleep(10000);
+
+        // 모든 수행이 완료되면 기대값인 100과 동일한지 확인
+        long resultCnt = couponRepository.count();
+
+        // 좌측 : 기대값 , 우측 : 실제 발행된 쿠폰 수량
+        assertEquals(100, resultCnt);
+
+    }   // End Test 2-3
+
 }

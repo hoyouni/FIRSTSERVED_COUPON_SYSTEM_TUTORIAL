@@ -1,6 +1,7 @@
 package com.example.coupon_system_tutorial.service;
 
 import com.example.coupon_system_tutorial.domain.Coupon;
+import com.example.coupon_system_tutorial.producer.CouponCreateProducer;
 import com.example.coupon_system_tutorial.repository.CouponCountRepository;
 import com.example.coupon_system_tutorial.repository.CouponRepository;
 import org.springframework.stereotype.Service;
@@ -22,9 +23,13 @@ public class ApplyService {
     // redis incr 명령어 사용을 위한 변수 생성
     private final CouponCountRepository couponCountRepository;
 
-    public ApplyService(CouponRepository couponRepository, CouponCountRepository couponCountRepository) {
+    // kafka 템플릿을 통해 topic 에 데이터를 보내기 위한 producer 변수 생성
+    private final CouponCreateProducer couponCreateProducer;
+
+    public ApplyService(CouponRepository couponRepository, CouponCountRepository couponCountRepository, CouponCreateProducer couponCreateProducer) {
         this.couponRepository = couponRepository;
         this.couponCountRepository = couponCountRepository;
+        this.couponCreateProducer = couponCreateProducer;
     }
 
     // Redis 사용 전 쿠폰 발급 로직 (상세 내용은 ApplyServiceTest 클래스 확인)
@@ -53,5 +58,19 @@ public class ApplyService {
 
         // 그 외의 경우 쿠폰 엔티티에 행 추가 해줌
         couponRepository.save(new Coupon(userId));
+    }
+
+    // Redis + kafka 를 활용한 쿠폰 발급 로직 (상세 내용은 ApplyServiceTest 클래스 확인)
+    public void applyBasedOnRedisWithKafka(Long userId) {
+        // 쿠폰을 발급하기 전(쿠폰발급 테이블 행 추가 전) 에 현재 발급된 쿠폰의 갯수를 증가 시킴
+        Long count = couponCountRepository.increment();
+
+        // 발급갯수가 100개보다 많다면 발급 안해줌
+        if(count > 100) {
+            return;
+        }
+
+        // kafka Topic 에 userId 전송
+        couponCreateProducer.create(userId);
     }
 }
