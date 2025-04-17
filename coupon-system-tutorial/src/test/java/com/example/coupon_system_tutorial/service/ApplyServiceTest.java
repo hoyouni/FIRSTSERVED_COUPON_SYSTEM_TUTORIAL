@@ -92,4 +92,69 @@ class ApplyServiceTest {
         assertEquals(100, resultCnt);
 
     }
+
+
+    /**
+     * Test 2-2) Redis 를 활용하여 동시에 요청이 여러개가 들어오는 경우 쿠폰 정상 발급 여부 체크
+     * Race Condition 은 두 개 이상의 스레드에서 공유 자원에 대해 엑세스 할 때 발생하는 문제로
+     * 싱글 스레드로 작업한다면 Race Condition 은 발생하지 않을 것임.
+     * - 방안 1 : 자바에서 제공하는 synchronized 를 사용
+     *  . 서버가 여러대가 된다면 다시 Race Condition 발생할 수 있음
+     * - 방안 2 : MySql + Redis 를 활용한 Lock
+     *  . 우리가 원하는 건 쿠폰 개수에 대한 정합성인데 Lock 을 활용하여 구현한다면
+     *    발급된 쿠폰 개수를 가져오는 것 부터 쿠폰을 생성하는 것 까지 Lock 을 걸어야 함
+     *    그렇게 된다면 Lock 을 거는 구간이 길어져 성능상 불이익 발생함
+     *    예를 들어서 저장하는 로직까지 2초가 걸리게 된다면 Lock 은 2초 뒤에 풀리게 되고 사용자들은 그만큼 기다려야 함.
+     * 선착순 쿠폰 발급의 핵심은 쿠폰 갯수이므로 쿠폰 갯수 체크에 대한 정합성만 관리하면 됨.
+     *  - 방안 3 : Redis 를 활용하여 핵심 로직 (쿠폰 갯수 체크 및 increase) 구현
+     *   . Redis 에는 incr 이라는 명령어가 존재하고 이 명령어는 key 에 대한 value 를 1 씩 증가시키는 명령어임.
+     *     Redis 는 싱글 스레드 기반으로 동작하여 Race Condition 을 해결할 수 있을 뿐만 아니라
+     *     incr 명령어는 성능도 굉장히 빠르고 데이터 정합성도 보장됨.
+     *     * incr key 에 해당하는 숫자를 1씩 증가시키고 증가된 값을 리턴하는 명령어
+     *       exec ) {coupon_count : 0}
+     *              git bash > incr coupon_count 실행
+     *              {coupon_count : 1}
+     *              git bash > incr coupon_count 실행
+     *              {coupon_count : 2}
+     *              ...
+     *     * 참고로 flushAll 은 데이터 초기화 명령어
+     * 우리는 incr 명령어를 활용하여 발급된 쿠폰의 갯수를 제어할 것임.
+     * 쿠폰을 발급하기 전에 coupon_count 를 1 증가시키고 리턴되는 값이 100 보다 크다면
+     * 이미 100개 이상이 발급되었다는 뜻이므로 더 이상 쿠폰이 발급되면 안됨.
+     */
+    @Test
+    public void applyMultipleBasedOnRedis() throws InterruptedException {
+        // 천 개의 요청을 보낸다고 가정
+        int threadCnt = 1000;
+
+        // ExecutorService : 병렬작업을 간단하게 할 수 있도록 하는 자바 API
+        ExecutorService executorService = Executors.newFixedThreadPool(32);
+
+        /**
+         *  모든 요청이 끝날때까지 기다려야하므로 CountDownLatch 사용
+         *  CountDownLatch : 다른 스레드에서 수행하는 작업을 기다리도록 도와주는 클래스
+         */
+        CountDownLatch countDownLatch = new CountDownLatch(threadCnt);
+
+        // 반복문을 사용하여 threadCnt 만큼의 요청보냄
+        for(int i = 0; i < threadCnt; i++) {
+            long userId = i;
+            executorService.submit(() -> {
+                try {
+                    applyService.applyBasedOnRedis(userId);
+                } finally {
+                    countDownLatch.countDown();
+                }
+            });
+        }
+
+        countDownLatch.await();
+
+        // 모든 수행이 완료되면 기대값인 100과 동일한지 확인
+        long resultCnt = couponRepository.count();
+
+        // 좌측 : 기대값 , 우측 : 실제 발행된 쿠폰 수량
+        assertEquals(100, resultCnt);
+
+    }
 }
