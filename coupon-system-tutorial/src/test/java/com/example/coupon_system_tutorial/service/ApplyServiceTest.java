@@ -193,6 +193,22 @@ class ApplyServiceTest {
      *  kafka 를 사용하게 되면 Api 를 통해 직접 쿠폰을 발급할 때에 비해서 처리량을 조절할 수 있고
      *  처리량을 조절함에 따라 데이터베이스의 부하를 줄일 수 있다는 장점이 있음.
      *  다만, 테스트케이스에서 확인 했다시피 쿠폰 생성까지 약간의 텀이 발생된다는 단점이 존재한다.
+     *
+     *  *** 1인당 발급 가능한 쿠폰 갯수를 1개로 제한하기
+     *  방법 1) 데이터베이스의 유니크 키를 사용하여 제한
+     *   - 쿠폰 엔티티에 다른 컬럼들을 생성해둔 뒤 유니크 키 제약조건을 걸어 계정 당 한 개만 생성되도록 함
+     *    . 보통 서비스는 한 유저가 같은 타입의 쿠폰을 여러개 가질 수 있기 때문에 실용적인 방안은 아님
+     *
+     *  방법 2) 범위로 락을 잡고 처음에 쿠폰 발급 여부를 가져와서 판별
+     *   - 쿠폰 발급해주는 서비스 로직 시점 시작부터 끝까지 락을 걸어둔 뒤 발급여부를 체크하여 발급 or 미발급
+     *    . 현재 로직은 API 에서 쿠폰 발급 가능 여부만 판단하고 실제 쿠폰 생성은 Consumer 에서 진행됨
+     *      이 사이에는 시간 차가 존재하며 한 명이 두 개의 쿠폰이 발급되는 경우가 생길 수 있음.
+     *      API 에서 직접 쿠폰을 발급한다고 가정해도 락 범위가 너무 넓어져 그 락이 끝날 때 까지 해당 로직에 접근하지 못하여
+     *      성능 이슈가 발생할 수 있음.
+     *
+     *  방법 3) Set 자료구조를 사용하여 유저 아이디 별로 쿠폰 발급 갯수를 1개로 제한
+     *   - 값을 유니크하게 저장할 수 있는 자료구조 (중복 허용하지 않음) / 요소의 존재 여부를 빠르게 확인할 수 있음
+     *     Redis 에서도 Set 자료구조를 지원하기 때문에 Redis 를 사용하여 구현하고자 함
      */
     @Test
     public void applyMultipleBasedOnKafka() throws InterruptedException {
@@ -231,5 +247,66 @@ class ApplyServiceTest {
         assertEquals(100, resultCnt);
 
     }   // End Test 2-3
+
+
+    /**
+     * Test 2-4) Redis + kafka 를 활용하여 동시에 요청이 여러개가 들어오는 경우 쿠폰 정상 발급 여부 체크
+     *          + 1인당 쿠폰 발급 갯수 중복 가능 여부 테스트
+     *
+     *  *** 1인당 발급 가능한 쿠폰 갯수를 1개로 제한하기
+     *  방법 1) 데이터베이스의 유니크 키를 사용하여 제한
+     *   - 쿠폰 엔티티에 다른 컬럼들을 생성해둔 뒤 유니크 키 제약조건을 걸어 계정 당 한 개만 생성되도록 함
+     *    . 보통 서비스는 한 유저가 같은 타입의 쿠폰을 여러개 가질 수 있기 때문에 실용적인 방안은 아님
+     *
+     *  방법 2) 범위로 락을 잡고 처음에 쿠폰 발급 여부를 가져와서 판별
+     *   - 쿠폰 발급해주는 서비스 로직 시점 시작부터 끝까지 락을 걸어둔 뒤 발급여부를 체크하여 발급 or 미발급
+     *    . 현재 로직은 API 에서 쿠폰 발급 가능 여부만 판단하고 실제 쿠폰 생성은 Consumer 에서 진행됨
+     *      이 사이에는 시간 차가 존재하며 한 명이 두 개의 쿠폰이 발급되는 경우가 생길 수 있음.
+     *      API 에서 직접 쿠폰을 발급한다고 가정해도 락 범위가 너무 넓어져 그 락이 끝날 때 까지 해당 로직에 접근하지 못하여
+     *      성능 이슈가 발생할 수 있음.
+     *
+     *  (채택) 방법 3) Set 자료구조를 사용하여 유저 아이디 별로 쿠폰 발급 갯수를 1개로 제한
+     *   - 값을 유니크하게 저장할 수 있는 자료구조 (중복 허용하지 않음) / 요소의 존재 여부를 빠르게 확인할 수 있음
+     *     Redis 에서도 Set 자료구조를 지원하기 때문에 Redis 를 사용하여 구현하고자 함
+     */
+    @Test
+    public void applyMultipleBasedOnKafkaWithDupChk() throws InterruptedException {
+        // 천 개의 요청을 보낸다고 가정
+        int threadCnt = 1000;
+
+        // ExecutorService : 병렬작업을 간단하게 할 수 있도록 하는 자바 API
+        ExecutorService executorService = Executors.newFixedThreadPool(32);
+
+        /**
+         *  모든 요청이 끝날때까지 기다려야하므로 CountDownLatch 사용
+         *  CountDownLatch : 다른 스레드에서 수행하는 작업을 기다리도록 도와주는 클래스
+         */
+        CountDownLatch countDownLatch = new CountDownLatch(threadCnt);
+
+        // 반복문을 사용하여 threadCnt 만큼의 요청보냄
+        for(int i = 0; i < threadCnt; i++) {
+            long userId = i;
+            executorService.submit(() -> {
+                try {
+                    // 유저 아이디를 하드코딩 하여 중복으로 집어넣어보고 중복 가능여부 테스트
+                    applyService.applyBasedOnRedisWithKafka(1L);
+                } finally {
+                    countDownLatch.countDown();
+                }
+            });
+        }
+
+        countDownLatch.await();
+
+        Thread.sleep(10000);
+
+        // 모든 수행이 완료되면 기대값인 100과 동일한지 확인
+        long resultCnt = couponRepository.count();
+
+        // 좌측 : 기대값 , 우측 : 실제 발행된 쿠폰 수량
+        // 중복 허용을 막았기 때문에 기대값인 1과 실제 발급수량이 동일해야함
+        assertEquals(1, resultCnt);
+
+    }   // End Test 2-4
 
 }

@@ -2,6 +2,7 @@ package com.example.coupon_system_tutorial.service;
 
 import com.example.coupon_system_tutorial.domain.Coupon;
 import com.example.coupon_system_tutorial.producer.CouponCreateProducer;
+import com.example.coupon_system_tutorial.repository.AppliedUserRepository;
 import com.example.coupon_system_tutorial.repository.CouponCountRepository;
 import com.example.coupon_system_tutorial.repository.CouponRepository;
 import org.springframework.stereotype.Service;
@@ -26,10 +27,14 @@ public class ApplyService {
     // kafka 템플릿을 통해 topic 에 데이터를 보내기 위한 producer 변수 생성
     private final CouponCreateProducer couponCreateProducer;
 
-    public ApplyService(CouponRepository couponRepository, CouponCountRepository couponCountRepository, CouponCreateProducer couponCreateProducer) {
+    // Set 데이터 저장을 위한 변수 생성
+    private final AppliedUserRepository appliedUserRepository;
+
+    public ApplyService(CouponRepository couponRepository, CouponCountRepository couponCountRepository, CouponCreateProducer couponCreateProducer, AppliedUserRepository appliedUserRepository) {
         this.couponRepository = couponRepository;
         this.couponCountRepository = couponCountRepository;
         this.couponCreateProducer = couponCreateProducer;
+        this.appliedUserRepository = appliedUserRepository;
     }
 
     // Redis 사용 전 쿠폰 발급 로직 (상세 내용은 ApplyServiceTest 클래스 확인)
@@ -62,6 +67,15 @@ public class ApplyService {
 
     // Redis + kafka 를 활용한 쿠폰 발급 로직 (상세 내용은 ApplyServiceTest 클래스 확인)
     public void applyBasedOnRedisWithKafka(Long userId) {
+
+        // 쿠폰 요청 시 Set 자료구조에 applied_userId : userId 를 담아줌
+        Long apply = appliedUserRepository.add(userId);
+
+        // 만약 추가된 갯수가 1이 아니라면 이 유저는 이미 발급 요청을 했던 유저로 더 이상 진행하지 않고 리턴해줌
+        if(apply != 1) {
+            return;
+        }
+
         // 쿠폰을 발급하기 전(쿠폰발급 테이블 행 추가 전) 에 현재 발급된 쿠폰의 갯수를 증가 시킴
         Long count = couponCountRepository.increment();
 

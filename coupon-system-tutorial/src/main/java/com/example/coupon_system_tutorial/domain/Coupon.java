@@ -7,6 +7,7 @@ import jakarta.persistence.Id;
 
 /**
  * 발급쿠폰 엔티티 생성
+ *
  */
 @Entity
 public class Coupon {
